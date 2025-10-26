@@ -12,6 +12,7 @@ A Python-based Retrieval-Augmented Generation (RAG) application that answers que
 - Loads and processes PDF documents.
 - Uses RAG to retrieve relevant sections and generate accurate answers.
 - (More features coming as project progresses)
+- Loads and processes PDF documents into chunks for RAG pipeline using PyPDF, with dynamic path handling and error checking for robust ingestion.
 
 ## Demo
 - (Add screenshot or live link later)
