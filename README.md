@@ -1,20 +1,21 @@
 # RAG Document Q&A Chatbot
 
-A **Streamlit-based Retrieval-Augmented Generation (RAG)** chatbot that answers your questions using uploaded documents (PDF, DOCX, or TXT).  
-It uses **hybrid retrieval (semantic + keyword search)** with **SentenceTransformer** and **BM25**, powered by the **Ollama Qwen2.5-Coder:3b** model.
+A **Streamlit-based Retrieval-Augmented Generation (RAG)** chatbot that answers questions from uploaded documents (PDF, DOCX, TXT).  
+Uses **hybrid retrieval (semantic + BM25 with RRF fusion)** via **SentenceTransformer (all-mpnet-base-v2)** and powered by **Ollama Llama 3.1:8b**.
 
 ---
 
 ## Features
 
 - Upload and analyze **PDF**, **DOCX**, or **TXT** files  
-- Uses **SentenceTransformer (all-MiniLM-L6-v2)** for embeddings  
-- Combines **semantic search** (vector) and **keyword search** (BM25) for higher accuracy  
-- Chat interface with **conversation memory** (3 previous exchanges)  
-- Answers are strictly limited to your document — **no hallucinations**  
-- Built with **Streamlit** for a simple, interactive UI  
-- Stores document embeddings in an **in-memory Chroma vector database**  
-- Fully offline compatible (only Ollama required)
+- **Smarter chunking** with overlap and sentence-aware splitting  
+- **Hybrid search** with **RRF ranking** for better accuracy  
+- Natural follow-ups handled via **LLM context reasoning**  
+- **"Search deeper"** button to retrieve more context on demand  
+- **No hallucinations** — answers strictly from document  
+- Built with **Streamlit** for clean, interactive UI  
+- **In-memory ChromaDB** for fast, isolated vector search  
+- **Fully offline** (only Ollama required)
 
 ---
 
@@ -50,7 +51,7 @@ Follow [Ollama’s installation guide](https://ollama.ai/download).
 
 Then pull the required model and start the server:
 ```bash
-ollama pull qwen2.5-coder:3b
+ollama pull llama3.1:8b-instruct-q4_0
 ollama serve
 ```
 
@@ -60,7 +61,7 @@ ollama serve
 
 Start the chatbot interface:
 ```bash
-streamlit run rag_pipeline.py
+streamlit run src/app.py
 ```
 
 > **Note:** The app automatically starts the Ollama server if it’s not running.
@@ -72,22 +73,22 @@ streamlit run rag_pipeline.py
 1. Open the Streamlit app (usually at [http://localhost:8501](http://localhost:8501))  
 2. Upload a **PDF**, **DOCX**, or **TXT** file  
 3. Ask any question related to the document  
-4. View retrieved chunks and AI-generated answers  
+4. Use "Not sure? Search deeper" for expanded results 
 
 ---
 
 ## Dependencies
 
-- `streamlit`  
-- `pypdf`  
-- `python-docx`  
-- `langchain_text_splitters`  
-- `sentence_transformers`  
-- `chromadb`  
-- `ollama-python`  
-- `rank_bm25`  
-- `requests`
-
+• streamlit
+• pypdf
+• python-docx
+• langchain-text-splitters
+• sentence-transformers
+• chromadb
+• ollama-python
+• rank-bm25
+• numpy
+• requests
 ---
 
 ## Author
