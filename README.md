@@ -79,16 +79,16 @@ streamlit run src/app.py
 
 ## Dependencies
 
-• streamlit
-• pypdf
-• python-docx
-• langchain-text-splitters
-• sentence-transformers
-• chromadb
-• ollama-python
-• rank-bm25
-• numpy
-• requests
+- streamlit
+- pypdf
+- python-docx
+- langchain-text-splitters
+- sentence-transformers
+- chromadb
+- ollama-python
+- rank-bm25
+- numpy
+- requests
 ---
 
 ## Author
