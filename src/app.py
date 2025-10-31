@@ -10,6 +10,7 @@ from rank_bm25 import BM25Okapi
 import subprocess
 import time
 import requests
+import numpy as np
 
 # =============================================
 # 1. PAGE CONFIG & UI
@@ -23,7 +24,6 @@ st.write("**Upload → Ask → Get 100% accurate answers from your file**")
 # 2. OLLAMA SERVER HANDLER
 # =============================================
 def start_ollama():
-    """Start Ollama server if not running."""
     try:
         requests.get("http://localhost:11434", timeout=2)
     except:
@@ -34,10 +34,9 @@ def start_ollama():
 
 
 # =============================================
-# 3. TEXT EXTRACTION FROM PDF/TXT/DOCX
+# 3. TEXT EXTRACTION
 # =============================================
 def extract_text(uploaded_file):
-    """Extract raw text from uploaded file."""
     bytes_data = uploaded_file.getvalue()
     name = uploaded_file.name.lower()
 
@@ -54,10 +53,9 @@ def extract_text(uploaded_file):
 
 
 # =============================================
-# 4. DOCUMENT CHUNKING & EMBEDDING
+# 4. CHUNKING & INDEXING
 # =============================================
 def load_and_index(uploaded_file):
-    """Split document into chunks, embed, and store in Chroma."""
     if not uploaded_file:
         st.warning("Upload a file.")
         return None, None, None, None
@@ -67,93 +65,132 @@ def load_and_index(uploaded_file):
         st.error("No text in file.")
         return None, None, None, None
 
-    # Optimal chunk size for tables & paragraphs
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    chunks = splitter.create_documents([text], metadatas=[{"source": uploaded_file.name}])
+    # ---------- smarter chunking ----------
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=600,
+        separators=["\n\n", "\n", ". ", "! ", "? "],
+        keep_separator=True
+    )
+    docs = splitter.create_documents([text])
+    metadatas = [
+        {"source": uploaded_file.name, "section": f"Section {i//4 + 1}"}
+        for i in range(len(docs))
+    ]
+    for d, m in zip(docs, metadatas):
+        d.metadata = m
 
-    # Load embedding model
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    texts = [c.page_content for c in chunks]
+    # ---------- embeddings ----------
+    model = SentenceTransformer('all-mpnet-base-v2')
+    texts = [d.page_content for d in docs]
     with st.spinner(f"Embedding {len(texts)} chunks..."):
         embeddings = model.encode(texts, batch_size=16)
 
-    # BM25 for keyword search
+    # ---------- BM25 ----------
     tokenized = [t.lower().split() for t in texts]
     bm25 = BM25Okapi(tokenized)
 
-    # In-memory Chroma DB
+    # ---------- Chroma ----------
     client = chromadb.Client()
     collection = client.get_or_create_collection("rag_docs")
-    
-    # CLEAR OLD DATA → 100% document isolation
     existing = collection.get()
     if existing['ids']:
         collection.delete(ids=existing['ids'])
 
-    # Store in vector DB
     collection.add(
         documents=texts,
         embeddings=embeddings,
-        metadatas=[c.metadata for c in chunks],
-        ids=[f"chunk_{i}" for i in range(len(chunks))]
+        metadatas=[d.metadata for d in docs],
+        ids=[f"chunk_{i}" for i in range(len(docs))]
     )
 
-    st.success(f"Loaded **{uploaded_file.name}** → {len(chunks)} chunks")
-    return collection, model, bm25, chunks
+    st.success(f"Loaded **{uploaded_file.name}** → {len(docs)} chunks")
+    return collection, model, bm25, docs
 
 
 # =============================================
-# 5. HYBRID SEARCH (Semantic + Keyword)
+# 5. HYBRID SEARCH + RRF
 # =============================================
-def hybrid_search(question, collection, model, bm25, chunks, top_k=3):
-    """Retrieve top-k relevant chunks using semantic + BM25."""
-    if not collection:
+def hybrid_search(question, collection, model, bm25, chunks, top_k=7):
+    if not collection or not question:  # FIXED: Guard against empty question
+        st.error("No question or document loaded for search.")
         return []
 
-    # Semantic search
+    # ---- semantic ----
     q_emb = model.encode([question])
-    results = collection.query(query_embeddings=q_emb, n_results=5)
-    semantic = results['documents'][0] if results['documents'] else []
+    sem = collection.query(query_embeddings=q_emb, n_results=12)
+    sem_docs = sem['documents'][0]
+    sem_dist = sem['distances'][0]
+    if sem_dist:
+        max_d = max(sem_dist)
+        sem_scores = [1 - (d / max_d) for d in sem_dist]
+    else:
+        sem_scores = []
+    sem_rank = {doc: sc for doc, sc in zip(sem_docs, sem_scores)}
 
-    # Keyword search
+    # ---- BM25 ----
     q_tokens = question.lower().split()
-    scores = bm25.get_scores(q_tokens)
-    top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:5]
-    bm25_texts = [chunks[i].page_content for i in top_idx if i < len(chunks)]
+    bm25_scores = bm25.get_scores(q_tokens)
+    bm25_idx = np.argsort(bm25_scores)[::-1][:12]
+    bm25_docs = [chunks[i].page_content for i in bm25_idx if i < len(chunks)]
+    bm25_norm = [bm25_scores[i] for i in bm25_idx]
+    if bm25_norm and max(bm25_norm) > 0:
+        bm25_norm = [s / max(bm25_norm) for s in bm25_norm]
+    bm25_rank = {doc: sc for doc, sc in zip(bm25_docs, bm25_norm)}
 
-    # Combine & deduplicate
-    combined = list(dict.fromkeys(semantic + bm25_texts))[:top_k]
+    # ---- RRF ----
+    all_docs = set(sem_rank) | set(bm25_rank)
+    rrf = {}
+    k = 60
+    for doc in all_docs:
+        sr = list(sem_rank).index(doc) + 1 if doc in sem_rank else float('inf')
+        br = list(bm25_rank).index(doc) + 1 if doc in bm25_rank else float('inf')
+        rrf[doc] = (1 / (k + sr)) + (1 / (k + br))
 
-    # Show source chunks in UI
+    ranked = sorted(rrf.items(), key=lambda x: x[1], reverse=True)
+    combined = [doc for doc, _ in ranked][:top_k]
+
+    # UI: show chunks
     if combined:
         st.write(f"**From:** `{uploaded_file.name}`")
         for i, c in enumerate(combined):
             st.caption(f"Chunk {i+1}: {c[:200]}...")
+
     return combined
 
 
 # =============================================
-# 6. LLM ANSWER GENERATION WITH CHAT MEMORY
+# 6. LLM + MEMORY (UPDATED PROMPT FOR DOUBT HANDLING)
 # =============================================
 def ask_question(question, context, chat_history):
-    """Generate answer using document + recent chat (3 exchanges)."""
-    if not context:
-        return "No information found in your document."
+    if not context or not question:  # FIXED: Guard against empty inputs
+        return "No question or context available."
 
-    # Format retrieved passages
+    # ---- format context ----
     context_str = "\n\n".join([f"Passage {i+1}: {c}" for i, c in enumerate(context)])
-    
-    # Last 3 Q&A pairs (6 messages)
-    history_str = ""
-    for msg in chat_history[-6:]:
-        role = "User" if msg["role"] == "user" else "Assistant"
-        history_str += f"{role}: {msg['content']}\n"
-    
-    # Strict prompt to prevent hallucination
-        prompt = f"""You are a strict document assistant.
-Answer using ONLY the provided context.
-If the answer is not in the context, respond exactly: "Not found in the document."
-Do NOT use external knowledge. Do NOT guess.
+
+    # ---- recent 3 exchanges (6 msgs) ----
+    recent = chat_history[-6:]
+    hist = ""
+    for m in recent:
+        role = "User" if m["role"] == "user" else "Assistant"
+        hist += f"{role}: {m['content']}\n"
+
+    # ---- UPDATED PROMPT: Handles doubt implicitly ----
+    prompt = f"""You are a direct document assistant.
+Answer using ONLY the provided context and history.
+Quote the exact phrase or value from the context when possible.
+If the answer cannot be derived, say exactly "Not found in the document."
+Be concise - no explanations.
+
+For follow-ups like "Are you sure?" or "Is that right?": 
+- Re-review the context and history.
+- Confirm by quoting additional relevant passages if available.
+- If still uncertain, say "Based on the document, I confirm [answer], but here's more context: [quote]."
+- Do not hallucinate or add external info.
+
+Recent History (if any):
+{hist}
 
 Context:
 {context_str}
@@ -161,46 +198,96 @@ Context:
 Question: {question}
 
 Answer:"""
-    
+
     try:
-        api = GenerateAPI(model="qwen2.5-coder:3b")
-        response = api.generate(prompt=prompt)
-        return getattr(response, 'response', 'No answer').strip()
+        api = GenerateAPI(model="llama3.1:8b-instruct-q4_0")
+        resp = api.generate(prompt=prompt, options={"temperature": 0.0})
+        full = getattr(resp, 'response', 'No answer').strip()
+
+        if "Answer:" in full:
+            ans = full.split("Answer:")[-1].strip()
+        else:
+            lines = [l.strip() for l in full.split('\n') if l.strip()]
+            ans = lines[-1] if lines else "Not found in the document."
+        ans = ans.rstrip('.')
+        return ans
     except Exception as e:
         return f"Error: {e}"
 
 
 # =============================================
-# 7. MAIN APP FLOW
+# 7. MAIN FLOW
 # =============================================
 with st.sidebar:
     start_ollama()
     uploaded_file = st.file_uploader("Upload Document", type=['pdf', 'txt', 'docx'])
 
-# Load document if uploaded
+# ---- CACHE DOCUMENT ONCE ----
 if uploaded_file:
-    collection, model, bm25, chunks = load_and_index(uploaded_file)
+    if ("cached_file" not in st.session_state or 
+        st.session_state.cached_file != uploaded_file.name):
+        collection, model, bm25, chunks = load_and_index(uploaded_file)
+        st.session_state.collection = collection
+        st.session_state.model = model
+        st.session_state.bm25 = bm25
+        st.session_state.chunks = chunks
+        st.session_state.cached_file = uploaded_file.name
+    else:
+        collection = st.session_state.collection
+        model = st.session_state.model
+        bm25 = st.session_state.bm25
+        chunks = st.session_state.chunks
 else:
     st.info("Upload a file to begin.")
     st.stop()
 
-# Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "deep_search_trigger" not in st.session_state:
+    st.session_state.deep_search_trigger = False
 
-# Display chat history
+# ---- display history ----
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-# Handle new user input
+# ---- new input ----
 if prompt := st.chat_input("Ask about your document..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.last_prompt = prompt  # FIXED: Store prompt for deep search
     with st.chat_message("user"):
         st.write(prompt)
+
     with st.chat_message("assistant"):
-        with st.spinner("Searching..."):
-            context = hybrid_search(prompt, collection, model, bm25, chunks)
-            answer = ask_question(prompt, context, st.session_state.messages)
+        # Always use top_k=7 for consistency
+        ctx = hybrid_search(prompt, st.session_state.collection, st.session_state.model, 
+                           st.session_state.bm25, st.session_state.chunks, top_k=7)
+        answer = ask_question(prompt, ctx, st.session_state.messages)
+
         st.write(answer)
         st.session_state.messages.append({"role": "assistant", "content": answer})
+
+# FIXED: Deep search check moved outside 'if prompt' (runs every rerun)
+if st.session_state.deep_search_trigger and 'last_prompt' in st.session_state:
+    with st.chat_message("assistant"):
+        with st.spinner("Searching with more context..."):
+            deep_prompt = st.session_state.last_prompt
+            deep_ctx = hybrid_search(deep_prompt, st.session_state.collection, st.session_state.model, 
+                                   st.session_state.bm25, st.session_state.chunks, top_k=12)
+            deep_answer = ask_question(deep_prompt, deep_ctx, st.session_state.messages)
+        st.markdown("**Deep Search Result:**")
+        st.write(deep_answer)
+        st.session_state.messages.append({"role": "assistant", "content": f"Deep Search: {deep_answer}"})
+    st.session_state.deep_search_trigger = False  # Reset
+
+# Button to trigger deep search (only show if there's a last prompt)
+if 'last_prompt' in st.session_state and st.button("Not sure? Search deeper"):
+    st.session_state.deep_search_trigger = True
+    st.rerun()
+
+# ---- clear button ----
+if st.sidebar.button("Clear Chat History"):
+    st.session_state.messages = []
+    if 'last_prompt' in st.session_state:
+        del st.session_state.last_prompt
+    st.rerun()
